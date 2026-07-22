@@ -1,0 +1,10 @@
+venv/
+hf_cache/
+__pycache__/
+*.pyc
+.env
+temp/
+training_data/
+outputs/
+*.mp3
+rvc_venv/

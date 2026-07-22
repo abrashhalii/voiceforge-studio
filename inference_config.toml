@@ -1,0 +1,10 @@
+model = "F5TTS_Base"
+ref_audio = "D:\\Files\\Internhips\\Zenyro Labs Tasks\\Zenyro Labs Voice Studio\\temp\\trimmed_ref_gen.wav"
+ref_text = "This is a long audio recording designed to serve as a dataset for voice training."
+speed = 1.0
+nfe_step = 16
+gen_text = "Hey there! Welcome to the Voice Studio. If you can hear me clearly, that means the AI cloning is working perfectly."
+output_dir = "D:\\Files\\Internhips\\Zenyro Labs Tasks\\Zenyro Labs Voice Studio"
+output_file = "output_cloned.wav"
+
+[voices]
