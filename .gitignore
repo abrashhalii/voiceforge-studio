@@ -8,3 +8,8 @@ training_data/
 outputs/
 *.mp3
 rvc_venv/
+/api_test.wav
+/output_cloned.wav
+/podcast_output.wav
+/edited_audio.wav
+test_parser.py
