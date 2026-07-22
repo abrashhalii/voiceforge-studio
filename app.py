@@ -15,15 +15,16 @@ import sys
 import shutil
 from pydub import AudioSegment
 
-SAVED_VOICES_DIR = os.path.join(BASE_DIR, "saved_voices")
-os.makedirs(SAVED_VOICES_DIR, exist_ok=True)
-
-EDGE_TTS_EXE = os.path.join(BASE_DIR, "venv", "Scripts", "edge-tts.exe")
-F5_TTS_EXE = os.path.join(BASE_DIR, "venv", "Scripts", "f5-tts_infer-cli.exe")
-RVC_MODELS_DIR = os.path.join(BASE_DIR, "rvc_models")
-RVC_PYTHON_EXE = os.path.join(BASE_DIR, "rvc_venv", "Scripts", "python.exe")
-RVC_INFER_SCRIPT = os.path.join(BASE_DIR, "rvc_infer.py")
-os.makedirs(RVC_MODELS_DIR, exist_ok=True)
+from config import (
+    SAVED_VOICES_DIR, TRAINING_DIR, RVC_MODELS_DIR, RAW_AUDIO_DIR,
+    EDGE_TTS_EXE, F5_TTS_EXE, RVC_PYTHON_EXE, RVC_INFER_SCRIPT,
+    DEVICE, REF_AUDIO_MAX_SEC, F5_TIMEOUT_SEC, F5_FORCE_FP32,
+    F5_NFE_STEP, F5_SPEED, F5_CROSS_FADE,
+    DEFAULT_PAUSE_MS, CROSSFADE_MS,
+    CHUNK_SECONDS, NORMALIZE_DBFS, SILENCE_THRESH_DB,
+    MIN_SILENCE_LEN_MS, KEEP_SILENCE_MS, NOISE_REDUCTION_AMT,
+    SERVER_NAME, SERVER_PORT, SHARE,
+)
 
 # ─── Utility: Run edge-tts via subprocess (avoids asyncio conflicts with Gradio) ───
 def run_edge_tts(text, voice, output_path, rate=None, pitch=None):
@@ -115,63 +116,74 @@ def run_rvc_conversion(input_audio, model_name, pitch):
     else:
         return None, f"❌ RVC Error:\n{result.stdout}\n{result.stderr}"
 
-# ─── F5-TTS Core Engine ───
+# ─── F5-TTS Core Engine (persistent model — loaded once, reused) ───
+_F5_MODEL = None
+
+def get_f5_model():
+    """Lazy-load the F5-TTS model once and keep it in memory."""
+    global _F5_MODEL
+    if _F5_MODEL is None:
+        from f5_tts.api import F5TTS
+        print(f"Loading F5-TTS model on {DEVICE} (one-time, please wait)...")
+        _F5_MODEL = F5TTS(model="F5TTS_Base", device=DEVICE)
+
+        # GTX 16-series cards produce NaN in half precision.
+        # Force full precision (fp32) so inference stays numerically stable.
+        if F5_FORCE_FP32 and DEVICE.startswith("cuda"):
+            _F5_MODEL.ema_model = _F5_MODEL.ema_model.float()
+            try:
+                _F5_MODEL.vocoder = _F5_MODEL.vocoder.float()
+            except Exception:
+                pass
+            print("Forced model to fp32 for numerical stability.")
+
+        print("F5-TTS model loaded and cached in memory.")
+    return _F5_MODEL
+
+
 def run_f5tts(text, ref_audio_path, ref_text, output_name="output_cloned.wav"):
     output_path = os.path.join(BASE_DIR, output_name)
     trimmed = os.path.join(TEMP_DIR, "trimmed_ref_gen.wav")
 
     audio = AudioSegment.from_file(ref_audio_path)
-    if len(audio) > 8000:
-        audio = audio[:8000]
+    if len(audio) > REF_AUDIO_MAX_SEC * 1000:
+        audio = audio[:REF_AUDIO_MAX_SEC * 1000]
     audio.export(trimmed, format="wav")
 
     if os.path.exists(output_path):
         os.remove(output_path)
-        
-    # Prevent internal F5-TTS whisper from hanging on low VRAM
+
     if not ref_text or not ref_text.strip():
-        # define a dummy progress to pass to extract_text_fn
         class DummyProgress:
             def __call__(self, *args, **kwargs): pass
         ref_text = extract_text_fn(trimmed, progress=DummyProgress())
         if ref_text.startswith("Error"):
             return None, f"Failed to transcribe reference audio: {ref_text}"
 
-    import tomli_w
-    config_path = os.path.join(BASE_DIR, "inference_config.toml")
-    config_dict = {
-        "model": "F5TTS_Base", "ref_audio": trimmed,
-        "ref_text": ref_text.strip(),
-        "speed": 1.0, "nfe_step": 16, "gen_text": text,
-        "output_dir": BASE_DIR, "output_file": output_name, "voices": {}
-    }
-    with open(config_path, "wb") as f:
-        tomli_w.dump(config_dict, f)
-
-    env = os.environ.copy()
-    env.update({"TEMP": TEMP_DIR, "TMP": TEMP_DIR, "NUMBA_DISABLE_JIT": "1",
-                "HF_HOME": os.environ["HF_HOME"], "PYTHONIOENCODING": "utf-8"})
-
-    result = subprocess.run([F5_TTS_EXE, "-c", config_path],
-        capture_output=True, text=True, encoding='utf-8', env=env)
-
-    if result.returncode != 0:
-        return None, f"CLI Error: {result.stderr[-500:]}"
+    try:
+        model = get_f5_model()
+        wav, sr, _ = model.infer(
+            ref_file=trimmed,
+            ref_text=ref_text.strip(),
+            gen_text=text,
+            nfe_step=F5_NFE_STEP,
+            speed=F5_SPEED,
+            cross_fade_duration=F5_CROSS_FADE,
+            remove_silence=False,
+            file_wave=output_path,
+            show_info=lambda *a, **k: None,
+        )
+    except Exception as e:
+        return None, f"F5-TTS error: {e}"
 
     if os.path.exists(output_path):
         import soundfile as sf
         import numpy as np
-        data, sr = sf.read(output_path)
-        std = np.std(data)
-        if std < 0.001:
+        data, sr_read = sf.read(output_path)
+        if np.std(data) < 0.001:
             return None, "Output is silent. Try different reference audio."
-        return output_path, f"✅ Generated {len(data)/sr:.1f}s audio"
+        return output_path, f"✅ Generated {len(data)/sr_read:.1f}s audio"
 
-    import glob
-    wavs = glob.glob(os.path.join(BASE_DIR, "infer_cli_*.wav"))
-    if wavs:
-        latest = max(wavs, key=os.path.getmtime)
-        return latest, f"✅ Found: {os.path.basename(latest)}"
     return None, "❌ Output file not found!"
 
 # ─── Tab 1: Standard Clone ───
@@ -286,27 +298,74 @@ def extract_text_fn(audio_path, progress=gr.Progress()):
 import re
 
 def parse_podcast_script(script_text):
-    """Parse a script like 'NARUTO: Hey! \n LUFFY: Yo!' into [(name, line), ...]"""
-    lines = []
-    for raw_line in script_text.strip().split("\n"):
-        raw_line = raw_line.strip()
-        if not raw_line:
-            continue
-        match = re.match(r'^([A-Za-z0-9_]+)\s*:\s*(.+)$', raw_line)
+    """
+    Parse a podcast script into [(speaker, text), ...].
+
+    Tolerant of formatting: extra spaces, dashes instead of colons,
+    non-ASCII names, blank lines, and multi-line dialogue blocks.
+
+    Returns (segments, warnings) where warnings describe any lines
+    that could not be understood, with line numbers.
+    """
+    segments = []
+    warnings = []
+    current_speaker = None
+
+    # Matches "NAME:" or "NAME -" at the start of a line.
+    # \w with re.UNICODE covers non-ASCII names; spaces/dots/hyphens allowed
+    # inside the name, but the name must stay short to avoid swallowing
+    # ordinary sentences that happen to contain a colon.
+    speaker_pattern = re.compile(
+        r'^\s*([\w][\w\s.\'-]{0,30}?)\s*[:\-–—]\s*(.*)$',
+        re.UNICODE
+    )
+
+    for line_no, raw_line in enumerate(script_text.splitlines(), start=1):
+        line = raw_line.strip()
+
+        if not line:
+            continue  # blank lines are separators, not errors
+
+        match = speaker_pattern.match(line)
+
         if match:
-            name = match.group(1).strip()
-            dialogue = match.group(2).strip()
-            if dialogue:
-                lines.append((name, dialogue))
-    return lines
+            speaker = match.group(1).strip()
+            text = match.group(2).strip()
+
+            if not text:
+                # "ARIA:" with nothing after it — start of a multi-line block
+                current_speaker = speaker
+                continue
+
+            segments.append((speaker, text))
+            current_speaker = speaker
+
+        elif current_speaker:
+            # Continuation of the previous speaker's dialogue
+            segments.append((current_speaker, line))
+
+        else:
+            warnings.append(
+                f"Line {line_no}: could not identify a speaker in \"{line[:60]}\". "
+                f"Expected a format like: CHARACTER: dialogue"
+            )
+
+    if not segments and not warnings:
+        warnings.append("The script is empty. Add at least one line like: ARIA: Hello!")
+
+    return segments, warnings
 
 def generate_podcast(script_text, pause_ms, progress=gr.Progress()):
     if not script_text.strip():
         return None, "Write a script first."
 
-    parsed = parse_podcast_script(script_text)
+    parsed, parse_warnings = parse_podcast_script(script_text)
+
     if not parsed:
-        return None, "❌ Could not parse script. Use format:\nNARUTO: Hey Luffy!\nLUFFY: Hey Naruto!"
+        msg = "❌ Could not parse script. Use format:\nNARUTO: Hey Luffy!\nLUFFY: Hey Naruto!"
+        if parse_warnings:
+            msg += "\n\nDetails:\n" + "\n".join(parse_warnings)
+        return None, msg
 
     # Collect unique character names
     characters = list(dict.fromkeys([name for name, _ in parsed]))
@@ -427,8 +486,6 @@ def edit_audio_replace(audio_path, start_s, end_s, text, voice_name, progress=gr
         return None, f"❌ Error: {e}"
 
 # ─── ML FEATURE: Audio Dataset Preprocessing ───
-TRAINING_DIR = os.path.join(BASE_DIR, "training_data")
-os.makedirs(TRAINING_DIR, exist_ok=True)
 
 def preprocess_training_audio(audio_path, chunk_seconds=10, normalize_db=-20.0, progress=gr.Progress()):
     """Real ML data pipeline: chunk, normalize, and clean audio for model training."""
@@ -549,6 +606,15 @@ footer {display: none !important;}
 .zenvyro-header {text-align: center; padding: 20px 0; border-bottom: 2px solid #eee; margin-bottom: 20px;}
 .zenvyro-logo {font-size: 2.5em; font-weight: 800; color: #2563eb; letter-spacing: 2px;}
 .zenvyro-subtitle {font-size: 1.1em; color: #64748b; margin-top: 5px;}
+
+/* Fix: waveform scrollbar overlapping timestamp labels */
+.gradio-container div[class*="waveform"] {
+    padding-bottom: 22px !important;
+    overflow: visible !important;
+}
+.gradio-container div[class*="waveform"] > div {
+    overflow: visible !important;
+}
 """
 
 header_html = f"""
@@ -558,6 +624,7 @@ header_html = f"""
         <div class="zenvyro-subtitle">Internal Advanced Voice Studio • Clone anime voices • Dramatic storytelling • Multi-voice podcasts</div>
     </div>
 """
+
 
 with gr.Blocks(title="🎙️ Zenvyrolabs Voice Studio") as interface:
     gr.HTML(header_html)
@@ -824,4 +891,4 @@ The system uses **OpenAI Whisper's neural encoder** to extract voice embeddings 
 if __name__ == "__main__":
     print("Launching Advanced Voice Studio...")
     print(f"Saved Voices: {get_saved_voices()}")
-    interface.launch(server_name="127.0.0.1", inbrowser=True, css=custom_css)
+    interface.launch(server_name=SERVER_NAME, server_port=SERVER_PORT, share=SHARE, inbrowser=True, css=custom_css)
