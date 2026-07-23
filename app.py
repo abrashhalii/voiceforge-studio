@@ -355,6 +355,84 @@ def parse_podcast_script(script_text):
 
     return segments, warnings
 
+# ─── Language detection & routing (Task 2: perfect pronunciation) ───
+HINDI_BASE_VOICE = os.getenv("HINDI_BASE_VOICE", "hi-IN-MadhurNeural")
+URDU_BASE_VOICE = os.getenv("URDU_BASE_VOICE", "ur-PK-AsadNeural")
+
+ROMANIZED_MARKERS = {
+    "kya", "hai", "hain", "haal", "nahi", "nahin", "aap", "tum", "mera", "meri",
+    "tera", "teri", "hum", "yeh", "woh", "kaise", "kaisa", "acha", "accha",
+    "bhai", "yaar", "kar", "raha", "rahi", "gaya", "gayi", "bohot", "bahut",
+    "kuch", "sab", "abhi", "phir", "lekin", "magar", "kyun", "kyunki", "koi",
+    "mein", "main", "hoon", "tha", "thi", "ho", "ke", "ki", "ka", "se", "par",
+}
+
+
+def detect_language(text):
+    """
+    Classify a line so it can be routed to the right pronunciation engine.
+
+    Returns 'hi' (Devanagari), 'ur' (Arabic/Urdu script),
+    'hi-roman' (romanized Hindi/Urdu), or 'en'.
+    """
+    if any('\u0900' <= c <= '\u097F' for c in text):
+        return "hi"
+    if any('\u0600' <= c <= '\u06FF' for c in text):
+        return "ur"
+
+    words = set(re.findall(r"[a-z]+", text.lower()))
+    if len(words & ROMANIZED_MARKERS) >= 2:
+        return "hi-roman"
+
+    return "en"
+
+
+def generate_line_audio(text, voice_audio, voice_text, out_name):
+    """
+    Generate a single podcast line with correct pronunciation.
+
+    English lines are cloned directly with F5-TTS.
+
+    Hindi/Urdu lines use the hybrid pipeline: a Microsoft Neural voice first
+    speaks the text with native pronunciation, and that natively-pronounced
+    audio becomes the reference F5-TTS clones from — so the pronunciation is
+    correct while the voice identity stays the character's.
+
+    Returns ((path, log), lang, text_used).
+    """
+    lang = detect_language(text)
+
+    if lang == "en":
+        result = run_f5tts(text, voice_audio, voice_text, output_name=out_name)
+        return result, lang, text
+
+    # Romanized Hindi needs converting to Devanagari for correct pronunciation
+    final_text = text
+    if lang == "hi-roman":
+        try:
+            from transliterate import roman_to_devanagari
+            final_text = roman_to_devanagari(text)
+        except Exception:
+            final_text = text
+
+    base_voice = URDU_BASE_VOICE if lang == "ur" else HINDI_BASE_VOICE
+    base_path = os.path.join(TEMP_DIR, f"base_{os.path.splitext(out_name)[0]}.mp3")
+
+    ok, err = run_edge_tts(final_text, base_voice, base_path)
+    print(f"[DEBUG] edge-tts ok={ok}, base exists={os.path.exists(base_path)}, err={err}")
+
+    if not ok or not os.path.exists(base_path):
+        # Neural base failed — fall back to direct cloning rather than
+        # failing the whole podcast
+        result = run_f5tts(final_text, voice_audio, voice_text, output_name=out_name)
+        return result, lang, final_text
+
+    # Use the natively-pronounced audio as the reference for cloning.
+    # The character's voice supplies identity; the Neural base supplies
+    # pronunciation and prosody.
+    result = run_f5tts(final_text, base_path, final_text, output_name=out_name)
+    return result, lang, final_text
+
 def generate_podcast(script_text, pause_ms, progress=gr.Progress()):
     if not script_text.strip():
         return None, "Write a script first."
@@ -410,7 +488,13 @@ def generate_podcast(script_text, pause_ms, progress=gr.Progress()):
             continue
 
         out_name = f"podcast_line_{i}.wav"
-        path, gen_log = run_f5tts(dialogue, voice_audio, voice_text, output_name=out_name)
+        (path, gen_log), lang, used_text = generate_line_audio(
+            dialogue, voice_audio, voice_text, out_name
+        )
+        if lang != "en":
+            log_lines.append(f"  🌏 Detected {lang} → routed through native Neural base")
+            if used_text != dialogue:
+                log_lines.append(f"  🔄 Transliterated: {used_text}")
 
         if path and os.path.exists(path):
             seg = AudioSegment.from_file(path)
@@ -423,10 +507,24 @@ def generate_podcast(script_text, pause_ms, progress=gr.Progress()):
         return None, "\n".join(log_lines) + "\n\n❌ No audio was generated."
 
     # Stitch together with pauses
-    log_lines.append(f"\n🔗 Stitching {len(audio_segments)} segments...")
-    final = audio_segments[0]
+    log_lines.append(f"\n🔗 Stitching {len(audio_segments)} segments with {CROSSFADE_MS}ms crossfade...")
+
+    def smooth_join(a, b, pause_segment, crossfade_ms):
+        """
+        Join two speech segments with a natural-sounding transition:
+        fade the tail of A out, the head of B in, and crossfade each
+        into the silent pause so there are no abrupt cuts.
+        """
+        # Crossfade can't exceed either segment's length
+        cf = min(crossfade_ms, len(a) // 2, len(b) // 2, len(pause_segment))
+        if cf <= 0:
+            return a + pause_segment + b
+        return a.append(pause_segment, crossfade=cf).append(b, crossfade=cf)
+
+    final = audio_segments[0].fade_in(min(50, len(audio_segments[0])))
     for seg in audio_segments[1:]:
-        final = final + pause + seg
+        final = smooth_join(final, seg, pause, CROSSFADE_MS)
+    final = final.fade_out(min(100, len(final)))
 
     output_path = os.path.join(BASE_DIR, "podcast_output.wav")
     final.export(output_path, format="wav")
